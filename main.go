@@ -1,0 +1,341 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
+	"github.com/go-mysql-org/go-mysql/server"
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/pingcap/tidb/pkg/parser"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
+)
+
+const (
+	listenAddr      = ":3306"
+	masterAddr      = "127.0.0.1:3307" // MySQL master
+	slaveAddr       = "127.0.0.1:3308" // MySQL slave
+	replicationUser = "replicator"
+	replicationPass = "password"
+	serverID        = 1001
+)
+
+var (
+	dbParser *parser.Parser
+	masterDB *sql.DB
+	slaveDB  *sql.DB
+)
+
+func init() {
+	var err error
+	dbParser = parser.New()
+
+	// Initialize database connections
+	masterDB, err = sql.Open("mysql", fmt.Sprintf("root:password@tcp(%s)/", masterAddr))
+	if err != nil {
+		log.Printf("Failed to connect to master DB: %v", err)
+	} else {
+		masterDB.SetMaxOpenConns(25)
+		masterDB.SetConnMaxLifetime(time.Hour)
+	}
+
+	slaveDB, err = sql.Open("mysql", fmt.Sprintf("root:password@tcp(%s)/", slaveAddr))
+	if err != nil {
+		log.Printf("Failed to connect to slave DB: %v", err)
+	} else {
+		slaveDB.SetMaxOpenConns(25)
+		slaveDB.SetConnMaxLifetime(time.Hour)
+	}
+}
+
+// ProxyHandler handles MySQL protocol commands
+type ProxyHandler struct {
+	server.Handler
+}
+
+func (h *ProxyHandler) HandleQuery(query string) (*mysql.Result, error) {
+	log.Printf("Received query: %s", query)
+
+	// Parse SQL to determine type and tables
+	stmtNode, err := dbParser.ParseOneStmt(query, "", "")
+	if err != nil {
+		log.Printf("Failed to parse SQL: %v", err)
+		// Return an empty result and the error
+		return &mysql.Result{}, err
+	}
+
+	// Determine if it's a read or write operation
+	isWrite := isWriteOperation(stmtNode)
+
+	// Route to appropriate database
+	var db *sql.DB
+	if isWrite {
+		db = masterDB
+	} else {
+		db = slaveDB
+	}
+
+	// Execute query
+	result, err := db.QueryContext(context.Background(), query)
+	if err != nil {
+		log.Printf("Query execution failed: %v", err)
+		// Return an empty result and the error
+		return &mysql.Result{}, err
+	}
+	defer result.Close()
+
+	// Build mysql.Result from sql.Rows
+	mysqlResult := mysql.NewResult(&mysql.Resultset{})
+
+	// Get column names
+	columns, err := result.Columns()
+	if err != nil {
+		log.Printf("Failed to get columns: %v", err)
+		return &mysql.Result{}, err
+	}
+
+	// Build fields for each column
+	mysqlResult.Resultset.Fields = make([]*mysql.Field, len(columns))
+	for i, column := range columns {
+		mysqlResult.Resultset.Fields[i] = &mysql.Field{
+			Name: []byte(column),
+		}
+	}
+
+	// Fetch rows
+	values := make([][]interface{}, 0)
+	for result.Next() {
+		// Create a slice of interfaces to scan into
+		cols := make([]interface{}, len(columns))
+		colPtrs := make([]interface{}, len(columns))
+		for i := range cols {
+			colPtrs[i] = &cols[i]
+		}
+		if err := result.Scan(colPtrs...); err != nil {
+			log.Printf("Scan error: %v", err)
+			continue
+		}
+		values = append(values, cols)
+	}
+
+	// Convert values to FieldValues
+	for _, row := range values {
+		fieldValues := make([]mysql.FieldValue, len(row))
+		for j, val := range row {
+			switch v := val.(type) {
+			case string:
+				fieldValues[j] = mysql.NewFieldValue(mysql.FieldValueTypeString, 0, []byte(v))
+			case int:
+				fieldValues[j] = mysql.NewFieldValue(mysql.FieldValueTypeSigned, uint64(v), nil)
+			case int64:
+				fieldValues[j] = mysql.NewFieldValue(mysql.FieldValueTypeSigned, uint64(v), nil)
+			case float64:
+				fieldValues[j] = mysql.NewFieldValue(mysql.FieldValueTypeFloat, 0, []byte(fmt.Sprintf("%v", v)))
+			case []byte:
+				fieldValues[j] = mysql.NewFieldValue(mysql.FieldValueTypeString, 0, v)
+			case bool:
+				if v {
+					fieldValues[j] = mysql.NewFieldValue(mysql.FieldValueTypeSigned, 1, nil)
+				} else {
+					fieldValues[j] = mysql.NewFieldValue(mysql.FieldValueTypeSigned, 0, nil)
+				}
+			case nil:
+				fieldValues[j] = mysql.NewFieldValue(mysql.FieldValueTypeNull, 0, nil)
+			default:
+				// For unknown types, treat as string
+				fieldValues[j] = mysql.NewFieldValue(mysql.FieldValueTypeString, 0, []byte(fmt.Sprintf("%v", v)))
+			}
+		}
+		mysqlResult.Resultset.Values = append(mysqlResult.Resultset.Values, fieldValues)
+	}
+
+	mysqlResult.Status = mysql.SERVER_MORE_RESULTS_EXISTS
+	return mysqlResult, nil
+}
+
+// isWriteOperation determines if a SQL statement is a write operation
+func isWriteOperation(node ast.StmtNode) bool {
+	switch node.(type) {
+	case *ast.InsertStmt, *ast.UpdateStmt, *ast.DeleteStmt:
+		return true
+	default:
+		return false
+	}
+}
+
+func startBinlogListener() {
+	// Binlog listener for MySQL replication
+	go func() {
+		// Parse slaveAddr to get host and port
+		var host string
+		var port int
+		_, err := fmt.Sscanf(slaveAddr, "%s:%d", &host, &port)
+		if err != nil {
+			log.Printf("Invalid slave address format %s: %v", slaveAddr, err)
+			return
+		}
+
+		// Configure binlog syncer
+		cfg := replication.BinlogSyncerConfig{
+			Host:     host,
+			Port:     uint16(port),
+			User:     replicationUser,
+			Password: replicationPass,
+			ServerID: serverID,
+			Flavor:   "mysql",
+		}
+
+		syncer := replication.NewBinlogSyncer(cfg)
+
+		// Start streaming from current position
+		streamer, err := syncer.StartSync(mysql.Position{})
+		if err != nil {
+			log.Printf("Failed to start binlog sync: %v", err)
+			return
+		}
+		defer syncer.Close()
+
+		log.Println("Binlog listener started, waiting for events...")
+
+		// Create shutdown channel
+		sc := make(chan struct{})
+
+		// Process binlog events
+		for {
+			// Check for shutdown signal
+			select {
+			case <-sc:
+				return
+			default:
+			}
+
+			// Get next event with timeout
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ev, err := streamer.GetEvent(ctx)
+			cancel()
+
+			if err != nil {
+				if ctx.Err() == context.DeadlineExceeded {
+					continue // Timeout, check for shutdown
+				}
+				log.Printf("Error getting binlog event: %v", err)
+				time.Sleep(1 * time.Second) // Back off on error
+				continue
+			}
+
+			// Process different event types
+			switch ev.Header.EventType {
+			case replication.DELETE_ROWS_EVENTv0,
+				replication.DELETE_ROWS_EVENTv1,
+				replication.DELETE_ROWS_EVENTv2,
+				replication.UPDATE_ROWS_EVENTv0,
+				replication.UPDATE_ROWS_EVENTv1,
+				replication.UPDATE_ROWS_EVENTv2,
+				replication.WRITE_ROWS_EVENTv0,
+				replication.WRITE_ROWS_EVENTv1,
+				replication.WRITE_ROWS_EVENTv2:
+				// Row-based events - could invalidate cache for affected tables
+				log.Printf("Received binlog event: %v", ev.Header.EventType)
+				// TODO: Implement cache invalidation logic here
+
+			case replication.QUERY_EVENT:
+				// Statement-based replication
+				queryEvent := ev.Event.(*replication.QueryEvent)
+				log.Printf("Received binlog query: %s", string(queryEvent.Query))
+				// TODO: Parse query and invalidate cache
+
+			case replication.XID_EVENT:
+				// Transaction commit
+				// TODO: Handle transaction boundaries
+
+			default:
+				// Other event types
+				// log.Printf("Received binlog event: %v", ev.Header.EventType)
+			}
+		}
+	}()
+}
+func main() {
+	// Set up MySQL proxy server
+	s := server.NewServer(
+		"8.0.12",                   // serverVersion
+		mysql.DEFAULT_COLLATION_ID, // collationId
+		mysql.AUTH_NATIVE_PASSWORD, // defaultAuthMethod
+		nil,                        // rsaKey (nil for now)
+		nil,                        // tlsConfig (nil for now)
+	)
+	if s == nil {
+		log.Fatalf("Failed to create server")
+	}
+
+	// Start binlog listener in background (placeholder)
+	go startBinlogListener()
+
+	// Start TCP listener
+	log.Printf("Starting MySQL proxy on %s", listenAddr)
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Fatalf("Failed to listen on %s: %v", listenAddr, err)
+	}
+	defer ln.Close()
+
+	// Wait for shutdown signal in a separate goroutine
+	sc := make(chan os.Signal, 1)
+	signal.Notify(sc,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+		os.Interrupt,
+	)
+	go func() {
+		<-sc
+		log.Println("Shutting down server...")
+		ln.Close()
+		masterDB.Close()
+		slaveDB.Close()
+		log.Println("Server stopped")
+		os.Exit(0)
+	}()
+
+	// Accept connections and handle them
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-sc:
+				return
+			default:
+				log.Printf("Accept error: %v", err)
+				continue
+			}
+		}
+
+		// Handle each connection in a new goroutine
+		go handleConnection(conn, s)
+	}
+}
+
+// handleConnection handles a single MySQL connection
+func handleConnection(conn net.Conn, s *server.Server) {
+	defer conn.Close()
+
+	// Create a new MySQL connection with our handler
+	mysqlConn, err := s.NewConn(conn, "proxy", "", &ProxyHandler{})
+	if err != nil {
+		log.Printf("Failed to create MySQL connection: %v", err)
+		return
+	}
+
+	// Handle commands for this connection
+	if err := mysqlConn.HandleCommand(); err != nil {
+		log.Printf("Connection error: %v", err)
+	}
+}
